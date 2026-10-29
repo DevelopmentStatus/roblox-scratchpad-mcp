@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roblox-scratchpad-mcp"
+version = "0.1.0a1"
+description = "Local script workflow companion for Roblox Studio MCP tools"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "developmentstatus"}]
+dependencies = ["mcp>=1.27.1,<2"]
+classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Operating System :: Microsoft :: Windows"]
+
+[project.scripts]
+roblox-scratchpad-mcp = "scratchpad_mcp.server:main"
+
+[project.urls]
+Repository = "https://github.com/DevelopmentStatus/roblox-scratchpad-mcp"
+Issues = "https://github.com/DevelopmentStatus/roblox-scratchpad-mcp/issues"
+
+[tool.setuptools.packages.find]
+include = ["scratchpad_mcp*"]
+
+[tool.setuptools.package-data]
+scratchpad_mcp = ["plugin/*.luau"]

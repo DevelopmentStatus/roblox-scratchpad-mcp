@@ -1,0 +1,762 @@
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">ScratchpadBridge</string>
+      <ProtectedString name="Source"><![CDATA[-- ScratchpadBridge: authenticated local Studio link for roblox-scratchpad-mcp.
+--
+-- Edit data model: applies edited work/ copies to their scripts (after a compile check), exports
+-- scripts to a new export snapshot, runs queued "edit" commands and shows the status panel.
+-- Playtest server and client data models: run queued "server" and "client" commands.
+--
+-- Canonical source: scratchpad_mcp/plugin/ScratchpadBridge.server.luau.
+-- Build/install using python -m scratchpad_mcp --build-plugin OUTPUT / --install-plugin.
+
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+
+local DEFAULT_PORT = 35006 -- the push server's fixed port; the panel can override it until Studio restarts
+local SYNC_INTERVAL = 1
+local RETRY_INTERVAL = 3
+local MAX_EVENTS = 60
+local EXPORT_CHUNK_BYTES = 600 * 1024 -- Studio refuses posts over 1024 KB
+
+local EXPORT_ROOTS = {
+	"Workspace",
+	"ReplicatedFirst",
+	"ReplicatedStorage",
+	"ServerScriptService",
+	"ServerStorage",
+	"StarterGui",
+	"StarterPack",
+	"StarterPlayer",
+}
+local EXPORT_SKIP = {} -- no project-specific exclusions
+local SUFFIXES = {
+	{ ".server.luau", "Script" },
+	{ ".client.luau", "LocalScript" },
+	{ ".luau", "ModuleScript" },
+}
+
+local isEdit = RunService:IsEdit()
+local target = if isEdit then "edit" elseif RunService:IsServer() then "server" else "client"
+local peer = HttpService:GenerateGUID(false)
+local alive = true
+
+local function getSetting(name: string, default: any): any
+	local value = plugin:GetSetting(name)
+	return if value == nil then default else value
+end
+
+local state = {
+	port = getSetting("McpPort", DEFAULT_PORT),
+	token = getSetting("McpToken", ""),
+	sync = getSetting("McpSyncEnabled", false) :: boolean,
+	connected = false,
+	session = "",
+	lastError = "",
+}
+
+local onStateChanged: () -> () = function() end
+local onEvent: (string, string) -> () = function() end
+
+-- HTTP -------------------------------------------------------------------------
+
+local function request(method: string, path: string, body: any?): (any?, string?)
+	local ok, response = pcall(HttpService.RequestAsync, HttpService, {
+		Url = `http://127.0.0.1:{state.port}{path}`,
+		Method = method,
+		Headers = { ["Content-Type"] = "application/json", ["X-Scratchpad-Token"] = state.token },
+		Body = if body ~= nil then HttpService:JSONEncode(body) else nil,
+	})
+	if not ok then
+		return nil, tostring(response)
+	end
+	if not response.Success and response.StatusCode ~= 202 then
+		return nil, `HTTP {response.StatusCode}: {response.Body}`
+	end
+	local decoded, result = pcall(HttpService.JSONDecode, HttpService, response.Body)
+	if not decoded then
+		return nil, "bad JSON from server"
+	end
+	return result, nil
+end
+
+local function setConnected(connected: boolean, err: string?)
+	local changed = state.connected ~= connected or (err ~= nil and err ~= state.lastError)
+	state.connected = connected
+	state.lastError = err or ""
+	if changed then
+		onStateChanged()
+	end
+end
+
+local function logEvent(kind: string, message: string, path: string?)
+	onEvent(kind, if path then `{path}: {message}` else message)
+	task.spawn(request, "POST", "/api/log", { kind = kind, message = message, path = path })
+end
+
+-- Sync: work/ copies -> Studio scripts -----------------------------------------------
+
+local function splitSuffix(path: string): (string?, string?)
+	for _, entry in SUFFIXES do
+		local suffix = entry[1]
+		if path:sub(-#suffix) == suffix then
+			return path:sub(1, -#suffix - 1), entry[2]
+		end
+	end
+	return nil, nil
+end
+
+local function findScript(parent: Instance, name: string): LuaSourceContainer?
+	for _, child in parent:GetChildren() do
+		if child.Name == name and child:IsA("LuaSourceContainer") then
+			return child
+		end
+	end
+	return nil
+end
+
+-- Returns the script for a work/ path, creating it when only the script itself is missing.
+local function resolveScript(path: string): (LuaSourceContainer?, string?)
+	local stem, className = splitSuffix(path)
+	if not stem or not className then
+		return nil, "not a script file"
+	end
+	local parts = string.split(stem, "/")
+	if #parts < 2 then
+		return nil, "path needs a service and a name"
+	end
+	local found, node = pcall(game.GetService, game, parts[1])
+	if not found or not node then
+		return nil, `no service {parts[1]}`
+	end
+	for i = 2, #parts - 1 do
+		-- A script's children live under its name, so walk through scripts as well as folders.
+		local nextNode: Instance? = findScript(node, parts[i]) or node:FindFirstChild(parts[i])
+		if not nextNode then
+			return nil, `missing {table.concat(parts, ".", 1, i)}`
+		end
+		node = nextNode
+	end
+	local name = parts[#parts]
+	local existing = findScript(node, name)
+	if existing then
+		return existing, nil
+	end
+	local created = Instance.new(className) :: LuaSourceContainer
+	created.Name = name
+	created.Parent = node
+	return created, "created"
+end
+
+local function setSource(script: LuaSourceContainer, source: string): (boolean, string?)
+	local ok, err = pcall(ScriptEditorService.UpdateSourceAsync, ScriptEditorService, script, function()
+		return source
+	end)
+	if not ok then
+		ok, err = pcall(function()
+			(script :: any).Source = source
+		end)
+	end
+	return ok, if ok then nil else tostring(err)
+end
+
+local function applyFile(file: { path: string, source: string, revision: string })
+	local function ack(ok: boolean, message: string)
+		request("POST", "/api/ack", {
+			peer = peer, path = file.path, revision = file.revision, ok = ok, message = message,
+		})
+	end
+	local _, className = splitSuffix(file.path)
+	if not className then
+		ack(false, "not a script file")
+		return
+	end
+	local compiled, compileError = loadstring(file.source, "=" .. file.path)
+	if not compiled then
+		logEvent("error", `compile error, not applied: {compileError}`, file.path)
+		ack(false, tostring(compileError))
+		return
+	end
+	local recording = ChangeHistoryService:TryBeginRecording("ScratchpadBridge sync")
+	local script, note = resolveScript(file.path)
+	local ok, err = false, note
+	if script then
+		ok, err = setSource(script, file.source)
+	end
+	if recording then
+		ChangeHistoryService:FinishRecording(
+			recording,
+			if ok then Enum.FinishRecordingOperation.Commit else Enum.FinishRecordingOperation.Cancel
+		)
+	end
+	if ok then
+		logEvent("applied", if note == "created" then "created and applied" else "applied", file.path)
+		ack(true, if note == "created" then "created and applied" else "applied")
+	else
+		logEvent("error", `not applied: {err}`, file.path)
+		ack(false, tostring(err))
+	end
+end
+
+local function syncLoop()
+	while alive do
+		if state.sync then
+			local body, err = request("GET", `/api/changes?peer={peer}`)
+			setConnected(body ~= nil, err)
+			if body then
+				for _, file in body.files do
+					local ok, applyError = pcall(applyFile, file)
+					if not ok then
+						logEvent("error", tostring(applyError), file.path)
+					end
+				end
+			end
+		end
+		task.wait(if state.connected then SYNC_INTERVAL else RETRY_INTERVAL)
+	end
+end
+
+-- Export: Studio scripts -> a new local snapshot -------------------------------------------
+
+local function exportSuffix(script: LuaSourceContainer): string
+	if script:IsA("LocalScript") then
+		return ".client.luau"
+	elseif script:IsA("Script") then
+		return if (script :: Script).RunContext == Enum.RunContext.Client then ".client.luau" else ".server.luau"
+	end
+	return ".luau"
+end
+
+local function exportAll(): (boolean, string)
+	local files: { [string]: string } = {}
+	local duplicates = {}
+	local function walk(instance: Instance, path: string)
+		for _, child in instance:GetChildren() do
+			if EXPORT_SKIP[child:GetFullName()] then
+				continue
+			end
+			local childPath = `{path}/{child.Name}`
+			if child.Name:find("[/\\]") or child.Name:find(":", 1, true) then
+				error(`unsupported instance name in export: {child:GetFullName()}`)
+			end
+			if child:IsA("LuaSourceContainer") then
+				local file = childPath .. exportSuffix(child)
+				if files[file] then
+					table.insert(duplicates, file)
+				end
+				files[file] = ScriptEditorService:GetEditorSource(child :: LuaSourceContainer)
+			end
+			walk(child, childPath)
+		end
+	end
+	for _, name in EXPORT_ROOTS do
+		walk(game:GetService(name), name)
+	end
+	if #duplicates > 0 then
+		return false, "same-named sibling scripts, rename one: " .. table.concat(duplicates, ", ")
+	end
+
+	local names = {}
+	for file in files do
+		table.insert(names, file)
+	end
+	table.sort(names)
+	local chunks = { {} }
+	for _, file in names do
+		if #files[file] > 512 * 1024 then
+			return false, `script exceeds 512 KiB: {file}`
+		end
+		chunks[#chunks][file] = files[file]
+		if #HttpService:JSONEncode(chunks[#chunks]) > EXPORT_CHUNK_BYTES then
+			chunks[#chunks][file] = nil
+			if next(chunks[#chunks]) == nil then
+				return false, `encoded script exceeds export chunk limit: {file}`
+			end
+			table.insert(chunks, {})
+			chunks[#chunks][file] = files[file]
+			if #HttpService:JSONEncode(chunks[#chunks]) > EXPORT_CHUNK_BYTES then
+				return false, `encoded script exceeds export chunk limit: {file}`
+			end
+		end
+	end
+
+	local message = ""
+	local batch = HttpService:GenerateGUID(false)
+	for part, chunk in chunks do
+		local body, err = request("POST", "/api/export", { peer = peer, batch = batch, files = chunk, part = part, parts = #chunks })
+		if not body then
+			return false, `export failed on part {part}: {err}`
+		end
+		message = body.message
+	end
+	return true, message
+end
+
+-- Commands: Luau queued by `push_server.py run` ------------------------------------------------
+
+local function describe(value: any): string
+	if typeof(value) == "Instance" then
+		return value:GetFullName()
+	elseif type(value) == "table" then
+		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, value)
+		return if ok then encoded else tostring(value)
+	end
+	return tostring(value)
+end
+
+-- require() that compiles each module from its current Source, so edits apply without the
+-- Edit-mode require cache. Modules required inside it are loaded the same way, once per command.
+local function makeFreshRequire(baseEnv: { [string]: any })
+	local cache = {}
+	local function freshRequire(module: any): any
+		if typeof(module) ~= "Instance" or not module:IsA("ModuleScript") then
+			return require(module)
+		end
+		if cache[module] ~= nil then
+			return cache[module]
+		end
+		local chunk, err = loadstring(ScriptEditorService:GetEditorSource(module), "=" .. module:GetFullName())
+		if not chunk then
+			error(err, 2)
+		end
+		setfenv(chunk, setmetatable({ script = module, require = freshRequire }, { __index = baseEnv }))
+		local value = chunk()
+		cache[module] = value
+		return value
+	end
+	return freshRequire
+end
+
+-- loadstring exists in Edit, and in a playtest server when LoadStringEnabled is on; never on a client.
+local hasLoadstring = pcall(loadstring, "return")
+
+-- Compiles command code into a function taking (print, warn, plugin, freshRequire). Without
+-- loadstring, the code goes into a temporary ModuleScript, which plugins may write and require.
+local function compileCommand(code: string): (((...any) -> ...any)?, string?)
+	if hasLoadstring then
+		local chunk, err = loadstring(code, "=bridge")
+		if not chunk then
+			return nil, err
+		end
+		local baseEnv = getfenv(1)
+		return function(print, warn, pluginRef, freshRequire, ...)
+			setfenv(chunk, setmetatable({
+				print = print,
+				warn = warn,
+				plugin = pluginRef,
+				freshRequire = freshRequire,
+			}, { __index = baseEnv }))
+			return chunk(...)
+		end, nil
+	end
+	local module = Instance.new("ModuleScript")
+	module.Name = "ScratchpadBridgeCommand"
+	module.Source = "return function(print, warn, plugin, freshRequire)\n" .. code .. "\nend"
+	local ok, fn = pcall(require, module)
+	module:Destroy()
+	if not ok then
+		return nil, `compile or load error (see Output): {fn}`
+	end
+	return fn, nil
+end
+
+-- Runs one command here and returns its result table; never throws.
+local function runCommand(command: { id: string, code: string }): { [string]: any }
+	local output = {}
+	local function capture(prefix: string)
+		return function(...)
+			local parts = table.pack(...)
+			for i = 1, parts.n do
+				parts[i] = describe(parts[i])
+			end
+			table.insert(output, prefix .. table.concat(parts, " ", 1, parts.n))
+		end
+	end
+
+	local result: { [string]: any } = { id = command.id, ok = false, output = output }
+	local ran, err = pcall(function()
+		local fn, compileError = compileCommand(command.code)
+		if not fn then
+			result.error = compileError
+			return
+		end
+		-- freshRequire recompiles from Source only where loadstring exists (Edit); a playtest's
+		-- require cache is already fresh.
+		local freshRequire = if hasLoadstring and isEdit then makeFreshRequire(getfenv(1)) else require
+		local packed = table.pack(xpcall(fn, debug.traceback, capture(""), capture("WARN "), plugin, freshRequire))
+		if packed[1] then
+			result.ok = true
+			result.returns = {}
+			for i = 2, packed.n do
+				table.insert(result.returns, describe(packed[i]))
+			end
+		else
+			result.error = tostring(packed[2])
+		end
+	end)
+	if not ran then
+		result.error = `bridge error: {err}`
+	end
+	return result
+end
+
+local function execute(command: { id: string, code: string, action: string? })
+	local result
+	if command.action == "export" then
+		local ran, ok, message = pcall(exportAll)
+		result = { id = command.id, ok = ran and ok, output = {}, returns = {} }
+		if ran and ok then
+			result.returns = { message }
+		else
+			result.error = tostring(if ran then message else ok)
+		end
+	else
+		result = runCommand(command)
+	end
+	result.peer = peer
+	onEvent(if result.ok then "command" else "error", `{target} command #{command.id} {if result.ok then "ran" else "failed"}`)
+	request("POST", "/api/results", result)
+end
+
+local function pollCommands(queue: string, peerId: string, handle: ({ id: string, code: string, action: string? }) -> ())
+	local place = HttpService:UrlEncode(game.Name)
+	while alive do
+		local body, err = request("GET", `/api/commands/next?target={queue}&peer={peerId}&place={place}&place_id={game.PlaceId}`)
+		if isEdit and not state.sync then
+			setConnected(body ~= nil, err)
+		end
+		if body and body.command then
+			handle(body.command)
+		elseif not body then
+			task.wait(RETRY_INTERVAL)
+		end
+	end
+end
+
+-- Client relay: clients cannot make HTTP requests, so the playtest server's plugin takes the
+-- "client" queue and passes each command to the client plugin over a RemoteFunction that exists
+-- only in the playtest.
+local RELAY_NAME = "ScratchpadBridgeRelay"
+local RELAY_TIMEOUT = 60
+
+local function relayToClient(relay: RemoteFunction, command: { id: string, code: string })
+	local Players = game:GetService("Players")
+	local player = Players:GetPlayers()[1]
+	local result
+	if not player then
+		result = { id = command.id, ok = false, output = {}, error = "no player in the playtest" }
+	else
+		local done = false
+		task.spawn(function()
+			local ok, reply = pcall(relay.InvokeClient, relay, player, command)
+			if not done then
+				result = if ok then reply else { id = command.id, ok = false, output = {}, error = `relay: {reply}` }
+				done = true
+			end
+		end)
+		local deadline = os.clock() + RELAY_TIMEOUT
+		while not done and os.clock() < deadline do
+			task.wait(0.1)
+		end
+		if not done then
+			done = true
+			result = {
+				id = command.id,
+				ok = false,
+				output = {},
+				error = `client plugin did not answer within {RELAY_TIMEOUT}s`,
+			}
+		end
+	end
+	result.id = command.id
+	result.peer = peer .. "-relay"
+	request("POST", "/api/results", result)
+end
+
+local function startServerRelay()
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local relay = Instance.new("RemoteFunction")
+	relay.Name = RELAY_NAME
+	relay.Archivable = false
+	relay.Parent = ReplicatedStorage
+	plugin.Unloading:Connect(function()
+		relay:Destroy()
+	end)
+	pollCommands("client", peer .. "-relay", function(command)
+		relayToClient(relay, command)
+	end)
+end
+
+local function startClientRelay()
+	local relay = game:GetService("ReplicatedStorage"):WaitForChild(RELAY_NAME, 60) :: RemoteFunction?
+	if relay then
+		relay.OnClientInvoke = runCommand
+	end
+end
+
+local function commandLoop()
+	if target == "client" then
+		startClientRelay()
+		return
+	end
+	if target == "server" then
+		task.spawn(startServerRelay)
+	end
+	pollCommands(target, peer, execute)
+end
+
+-- Panel (Edit only) ----------------------------------------------------------------------
+
+local function buildPanel()
+	local toolbar = plugin:CreateToolbar("Scratchpad")
+	local panelButton = toolbar:CreateButton("Bridge", "Show the scratchpad bridge panel", "")
+	local exportButton = toolbar:CreateButton("Export", "Export scripts to a new local snapshot", "")
+	panelButton.ClickableWhenViewportHidden = true
+	exportButton.ClickableWhenViewportHidden = true
+
+	local widget = plugin:CreateDockWidgetPluginGui(
+		"ScratchpadBridge",
+		DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 300, 360, 240, 200)
+	)
+	widget.Title = "Scratchpad Bridge"
+	panelButton:SetActive(widget.Enabled)
+	panelButton.Click:Connect(function()
+		widget.Enabled = not widget.Enabled
+	end)
+	widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		panelButton:SetActive(widget.Enabled)
+	end)
+
+	local function color(style: Enum.StudioStyleGuideColor): Color3
+		return settings().Studio.Theme:GetColor(style)
+	end
+
+	local root = Instance.new("Frame")
+	root.Size = UDim2.fromScale(1, 1)
+	root.BorderSizePixel = 0
+	root.Parent = widget
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 8)
+	padding.PaddingBottom = UDim.new(0, 8)
+	padding.PaddingLeft = UDim.new(0, 8)
+	padding.PaddingRight = UDim.new(0, 8)
+	padding.Parent = root
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = root
+
+	local themed = {}
+	local function label(text: string, order: number): TextLabel
+		local l = Instance.new("TextLabel")
+		l.Size = UDim2.new(1, 0, 0, 18)
+		l.BackgroundTransparency = 1
+		l.Font = Enum.Font.SourceSans
+		l.TextSize = 15
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.TextWrapped = true
+		l.Text = text
+		l.LayoutOrder = order
+		l.Parent = root
+		table.insert(themed, l)
+		return l
+	end
+	local function button(text: string, parent: Instance, width: number): TextButton
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(width, -4, 0, 24)
+		b.Font = Enum.Font.SourceSans
+		b.TextSize = 15
+		b.Text = text
+		b.AutoButtonColor = true
+		b.Parent = parent
+		table.insert(themed, b)
+		return b
+	end
+
+	local statusLabel = label("", 1)
+	statusLabel.Size = UDim2.new(1, 0, 0, 36)
+
+	local portRow = Instance.new("Frame")
+	portRow.Size = UDim2.new(1, 0, 0, 24)
+	portRow.BackgroundTransparency = 1
+	portRow.LayoutOrder = 2
+	portRow.Parent = root
+	local rowLayout = Instance.new("UIListLayout")
+	rowLayout.FillDirection = Enum.FillDirection.Horizontal
+	rowLayout.Padding = UDim.new(0, 4)
+	rowLayout.Parent = portRow
+	local portBox = Instance.new("TextBox")
+	portBox.Size = UDim2.new(0.34, -4, 0, 24)
+	portBox.Font = Enum.Font.Code
+	portBox.TextSize = 15
+	portBox.ClearTextOnFocus = false
+	portBox.Text = tostring(state.port)
+	portBox.Parent = portRow
+	table.insert(themed, portBox)
+	local syncButton = button("", portRow, 0.33)
+	local exportPanelButton = button("Export", portRow, 0.33)
+	local tokenBox = Instance.new("TextBox")
+	tokenBox.Size = UDim2.new(1, 0, 0, 24)
+	tokenBox.Font = Enum.Font.Code
+	tokenBox.TextSize = 13
+	tokenBox.ClearTextOnFocus = true
+	tokenBox.PlaceholderText = "Paste pairing token, then press Enter"
+	tokenBox.Text = if state.token ~= "" then "Token saved (click to replace)" else ""
+	tokenBox.LayoutOrder = 3
+	tokenBox.Parent = root
+	table.insert(themed, tokenBox)
+	tokenBox.FocusLost:Connect(function(enterPressed)
+		if enterPressed and tokenBox.Text ~= "" and tokenBox.Text ~= "Token saved (click to replace)" then
+			state.token = tokenBox.Text:match("^%s*(.-)%s*$") or ""
+			plugin:SetSetting("McpToken", state.token)
+			setConnected(false, "pairing")
+		end
+		tokenBox.Text = if state.token ~= "" then "Token saved (click to replace)" else ""
+	end)
+
+	label("Recent activity", 4)
+	local list = Instance.new("ScrollingFrame")
+	list.Size = UDim2.new(1, 0, 1, -150)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 6
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.CanvasSize = UDim2.new()
+	list.LayoutOrder = 5
+	list.Parent = root
+	local listLayout = Instance.new("UIListLayout")
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Parent = list
+
+	local function applyTheme()
+		root.BackgroundColor3 = color(Enum.StudioStyleGuideColor.MainBackground)
+		list.BackgroundColor3 = color(Enum.StudioStyleGuideColor.InputFieldBackground)
+		for _, item in themed do
+			item.TextColor3 = color(Enum.StudioStyleGuideColor.MainText)
+			if item:IsA("TextButton") then
+				item.BackgroundColor3 = color(Enum.StudioStyleGuideColor.Button)
+				item.BorderColor3 = color(Enum.StudioStyleGuideColor.ButtonBorder)
+			elseif item:IsA("TextBox") then
+				item.BackgroundColor3 = color(Enum.StudioStyleGuideColor.InputFieldBackground)
+				item.BorderColor3 = color(Enum.StudioStyleGuideColor.InputFieldBorder)
+			end
+		end
+	end
+	applyTheme()
+	settings().Studio.ThemeChanged:Connect(applyTheme)
+
+	local function refresh()
+		local where = `127.0.0.1:{state.port}`
+		if state.connected then
+			local session = if state.session ~= "" then ` (session {state.session:sub(1, 8)})` else ""
+			statusLabel.Text = `● Connected to {where}{session}`
+			statusLabel.TextColor3 = color(Enum.StudioStyleGuideColor.MainText)
+		else
+			statusLabel.Text = `○ Not connected to {where}\n{state.lastError:sub(1, 80)}`
+			statusLabel.TextColor3 = color(Enum.StudioStyleGuideColor.DimmedText)
+		end
+		syncButton.Text = if state.sync then "Sync: on" else "Sync: off"
+	end
+	onStateChanged = function()
+		if state.connected and state.session == "" then
+			task.spawn(function()
+				local body = request("GET", "/api/status")
+				if body then
+					state.session = body.version or ""
+					refresh()
+				end
+			end)
+		end
+		refresh()
+	end
+	refresh()
+
+	local eventCount = 0
+	onEvent = function(kind: string, message: string)
+		eventCount += 1
+		local line = Instance.new("TextLabel")
+		line.Size = UDim2.new(1, -8, 0, 0)
+		line.AutomaticSize = Enum.AutomaticSize.Y
+		line.BackgroundTransparency = 1
+		line.Font = Enum.Font.Code
+		line.TextSize = 13
+		line.TextWrapped = true
+		line.TextXAlignment = Enum.TextXAlignment.Left
+		line.TextColor3 = color(
+			if kind == "error" then Enum.StudioStyleGuideColor.ErrorText else Enum.StudioStyleGuideColor.MainText
+		)
+		line.Text = `{os.date("%H:%M:%S")} {message}`
+		line.LayoutOrder = -eventCount
+		line.Parent = list
+		local lines = list:GetChildren()
+		if #lines > MAX_EVENTS + 1 then
+			for _, child in lines do
+				if child:IsA("TextLabel") and child.LayoutOrder > -eventCount + MAX_EVENTS then
+					child:Destroy()
+				end
+			end
+		end
+	end
+
+	portBox.FocusLost:Connect(function()
+		local port = tonumber(portBox.Text)
+		if port and port >= 1024 and port <= 65535 then
+			state.port = port
+			plugin:SetSetting("McpPort", state.port)
+			state.session = ""
+			setConnected(false, "reconnecting")
+		end
+		portBox.Text = tostring(state.port)
+	end)
+	syncButton.Activated:Connect(function()
+		state.sync = not state.sync
+		plugin:SetSetting("McpSyncEnabled", state.sync)
+		refresh()
+	end)
+
+	local exporting = false
+	local function runExport()
+		if exporting then
+			return
+		end
+		exporting = true
+		onEvent("export", "exporting...")
+		local ran, ok, message = pcall(exportAll)
+		if not ran then
+			message = tostring(ok)
+			ok = false
+		end
+		if ok then
+			logEvent("export", message)
+		else
+			onEvent("error", message)
+		end
+		exporting = false
+	end
+	exportPanelButton.Activated:Connect(runExport)
+	exportButton.Click:Connect(runExport)
+end
+
+-- Start ------------------------------------------------------------------------------------
+
+plugin.Unloading:Connect(function()
+	alive = false
+end)
+
+if isEdit then
+	buildPanel()
+	task.spawn(syncLoop)
+elseif target == "server" and hasLoadstring then
+	-- Plugins cannot read LoadStringEnabled; a server only has loadstring when it is on.
+	warn(
+		"[ScratchpadBridge] ServerScriptService.LoadStringEnabled is on. It is saved with the place, "
+			.. "so live servers will allow loadstring too; turn it off before publishing."
+	)
+end
+task.spawn(commandLoop)
+]]></ProtectedString>
+    </Properties>
+  </Item>
+</roblox>

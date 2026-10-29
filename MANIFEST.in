@@ -1,0 +1,12 @@
+include README.md
+include pyproject.toml
+include MANIFEST.in
+include INSTALL_FOR_AGENTS.md
+include AGENTS.md
+include CLAUDE.md
+recursive-include scratchpad_mcp *.py *.luau
+recursive-include tests *.py
+recursive-include docs *.md
+recursive-include scratchpad_plugin *.rbxmx
+exclude push_server.py apply_work.luau build_clips_v3.luau
+prune blender

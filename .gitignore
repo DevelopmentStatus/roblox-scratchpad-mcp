@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.scratchpad-bridge/
+.env
+*.log
+# Original, project-specific helpers are not part of the public MCP package.
+/apply_work.luau
+/build_clips_v3.luau
+/blender/
+/push_server.py
+/scratchpad_plugin/*.server.luau
+/tmp*/
